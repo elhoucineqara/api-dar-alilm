@@ -9,12 +9,37 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Middleware
-app.use(cors({
-  origin: true, // Allow all origins
+// CORS configuration - Handle preflight requests BEFORE any redirects
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    // Allow all origins in production, or specific origins in development
+    callback(null, true);
+  },
   credentials: true,
-  exposedHeaders: ['Content-Type', 'Content-Disposition', 'Content-Length']
-}));
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
+  exposedHeaders: ['Content-Type', 'Content-Disposition', 'Content-Length'],
+  preflightContinue: false,
+  optionsSuccessStatus: 204
+};
+
+// Handle OPTIONS requests explicitly BEFORE CORS middleware to prevent redirects
+app.use((req, res, next) => {
+  if (req.method === 'OPTIONS') {
+    res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('Access-Control-Max-Age', '86400');
+    return res.status(204).end();
+  }
+  next();
+});
+
+// Apply CORS middleware
+app.use(cors(corsOptions));
 
 // Skip body parsing for upload routes - let multer handle it
 app.use((req, res, next) => {

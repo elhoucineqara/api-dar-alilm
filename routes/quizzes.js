@@ -30,6 +30,31 @@ const isInstructor = (req, res, next) => {
 
 // --- Module Quizzes ---
 
+// GET a single quiz by ID (for both instructors and students)
+router.get('/:id', async (req, res) => {
+  try {
+    const quiz = await Quiz.findById(req.params.id)
+      .populate({
+        path: 'questions',
+        populate: { path: 'answers' },
+        options: { sort: { order: 1 } }
+      })
+      .lean();
+    
+    if (!quiz) {
+      return res.status(404).json({ error: 'Quiz not found' });
+    }
+    
+    res.json({ quiz });
+  } catch (error) {
+    console.error('Error fetching quiz:', error);
+    if (error.name === 'CastError') {
+      return res.status(400).json({ error: 'Invalid quiz ID' });
+    }
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // GET quiz for a module
 router.get('/module/:moduleId', isInstructor, async (req, res) => {
   try {

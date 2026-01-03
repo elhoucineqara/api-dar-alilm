@@ -99,9 +99,13 @@ router.get('/posts/:id', async (req, res) => {
     const transformedPost = {
       ...post,
       author: post.authorId,
+      likes: post.likes?.map(id => id.toString()) || [], // Convert ObjectIds to strings
       replies: post.replies?.map(reply => ({
-        ...reply,
+        _id: reply._id.toString(), // Convert reply _id to string
+        content: reply.content, // Explicitly include content
         author: reply.authorId,
+        likes: reply.likes?.map(id => id.toString()) || [], // Convert reply likes too
+        createdAt: reply.createdAt, // Ensure createdAt is included
       })) || [],
     };
     
@@ -133,8 +137,27 @@ router.post('/posts/:id/like', isAuthenticated, async (req, res) => {
     }
 
     await post.save();
-    res.json({ post });
+    await post.populate('authorId', 'firstName lastName role profileImage');
+    await post.populate('courseId', 'title');
+    await post.populate('replies.authorId', 'firstName lastName role profileImage');
+    
+    // Transform to match frontend
+    const transformedPost = {
+      ...post.toObject(),
+      author: post.authorId,
+      likes: post.likes.map(id => id.toString()), // Convert ObjectIds to strings
+      replies: post.replies?.map(reply => ({
+        _id: reply._id.toString(), // Convert reply _id to string
+        content: reply.content, // Explicitly include content
+        author: reply.authorId,
+        likes: reply.likes?.map(id => id.toString()) || [], // Convert reply likes too
+        createdAt: reply.createdAt, // Ensure createdAt is included
+      })) || [],
+    };
+    
+    res.json({ post: transformedPost });
   } catch (error) {
+    console.error('Error liking post:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -166,9 +189,13 @@ router.post('/posts/:id/replies', isAuthenticated, async (req, res) => {
     const transformedPost = {
       ...post.toObject(),
       author: post.authorId,
+      likes: post.likes.map(id => id.toString()), // Convert ObjectIds to strings
       replies: post.replies?.map(reply => ({
-        ...reply,
+        _id: reply._id.toString(), // Convert reply _id to string
+        content: reply.content, // Explicitly include content
         author: reply.authorId,
+        likes: reply.likes?.map(id => id.toString()) || [], // Convert reply likes too
+        createdAt: reply.createdAt, // Ensure createdAt is included
       })) || [],
     };
     
@@ -202,8 +229,27 @@ router.post('/posts/:id/replies/:replyId/like', isAuthenticated, async (req, res
     }
 
     await post.save();
-    res.json({ post });
+    await post.populate('authorId', 'firstName lastName role profileImage');
+    await post.populate('courseId', 'title');
+    await post.populate('replies.authorId', 'firstName lastName role profileImage');
+    
+    // Transform to match frontend
+    const transformedPost = {
+      ...post.toObject(),
+      author: post.authorId,
+      likes: post.likes.map(id => id.toString()), // Convert ObjectIds to strings
+      replies: post.replies?.map(reply => ({
+        _id: reply._id.toString(), // Convert reply _id to string
+        content: reply.content, // Explicitly include content
+        author: reply.authorId,
+        likes: reply.likes?.map(id => id.toString()) || [], // Convert reply likes too
+        createdAt: reply.createdAt, // Ensure createdAt is included
+      })) || [],
+    };
+    
+    res.json({ post: transformedPost });
   } catch (error) {
+    console.error('Error liking reply:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -273,6 +319,34 @@ router.delete('/posts/:id', isAuthenticated, async (req, res) => {
     res.json({ message: 'Post deleted successfully' });
   } catch (error) {
     console.error('Error deleting post:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// DELETE a reply
+router.delete('/posts/:id/replies/:replyId', isAuthenticated, async (req, res) => {
+  try {
+    const post = await ForumPost.findById(req.params.id);
+    if (!post) {
+      return res.status(404).json({ error: 'Post not found' });
+    }
+
+    const reply = post.replies.id(req.params.replyId);
+    if (!reply) {
+      return res.status(404).json({ error: 'Reply not found' });
+    }
+
+    // Check if user is the author of the reply
+    if (reply.authorId.toString() !== req.user.userId) {
+      return res.status(403).json({ error: 'Unauthorized to delete this reply' });
+    }
+
+    reply.remove();
+    await post.save();
+    
+    res.json({ message: 'Reply deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting reply:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

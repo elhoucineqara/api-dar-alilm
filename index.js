@@ -69,10 +69,15 @@ const moduleRoutes = require('./routes/modules');
 const uploadRoutes = require('./routes/upload');
 const sectionRoutes = require('./routes/sections');
 const quizRoutes = require('./routes/quizzes');
+const publicQuizRoutes = require('./routes/public-quizzes');
 const filesRoutes = require('./routes/files');
+const contactRoutes = require('./routes/contact');
+const aboutRoutes = require('./routes/about');
+const certificatesRoutes = require('./routes/certificates');
 
 app.use('/api/auth', authRoutes);
 app.use('/api/courses', publicCoursesRoutes); // Public courses route (no auth required)
+app.use('/api/quizzes', publicQuizRoutes); // Public quiz route (requires auth, checks enrollment/ownership)
 app.use('/api/instructor/courses', courseRoutes);
 app.use('/api/instructor/modules', moduleRoutes);
 app.use('/api/instructor/sections', sectionRoutes);
@@ -82,6 +87,9 @@ app.use('/api/instructor', instructorRoutes);
 app.use('/api/student', studentRoutes);
 app.use('/api/forum', forumRoutes);
 app.use('/api/files', filesRoutes); // Public files route (no auth required)
+app.use('/api/contact', contactRoutes); // Public contact route
+app.use('/api/about', aboutRoutes); // Public about route
+app.use('/api/certificates', certificatesRoutes); // Public certificates route (no auth required)
 
 // Basic route
 app.get('/', (req, res) => {

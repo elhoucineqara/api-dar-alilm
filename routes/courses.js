@@ -194,6 +194,141 @@ router.get('/:id', isInstructor, async (req, res) => {
   }
 });
 
+// GET course training content (sections, quizzes, final exam in order) for instructors
+router.get('/:id/training', isInstructor, async (req, res) => {
+  try {
+    const courseId = req.params.id;
+
+    // Get course and verify ownership
+    const course = await Course.findOne({ 
+      _id: courseId, 
+      instructorId: req.user.userId 
+    })
+      .populate('categoryId', 'name')
+      .populate('instructorId', 'firstName lastName')
+      .populate({
+        path: 'finalExam',
+        populate: {
+          path: 'questions',
+          populate: {
+            path: 'answers'
+          },
+          options: { sort: { order: 1 } }
+        }
+      })
+      .lean();
+
+    if (!course) {
+      return res.status(404).json({ error: 'Course not found' });
+    }
+
+    // Get modules with populate
+    const modulesData = await Module.find({ courseId })
+      .sort({ order: 1 })
+      .populate({
+        path: 'quiz',
+        populate: {
+          path: 'questions',
+          populate: {
+            path: 'answers'
+          },
+          options: { sort: { order: 1 } }
+        }
+      })
+      .lean();
+
+    // Build training content in order
+    const trainingContent = [];
+
+    // Process each module
+    for (const module of modulesData) {
+      // Add sections
+      const sections = await Section.find({ moduleId: module._id })
+        .sort({ order: 1 })
+        .lean();
+
+      for (const section of sections) {
+        trainingContent.push({
+          type: 'section',
+          _id: section._id,
+          title: section.title,
+          moduleId: module._id,
+          moduleTitle: module.title,
+          order: section.order,
+          data: section
+        });
+      }
+
+      // Add module quiz after sections
+      if (module.quiz) {
+        const quiz = typeof module.quiz === 'object' ? module.quiz : await Quiz.findById(module.quiz)
+          .populate({
+            path: 'questions',
+            populate: {
+              path: 'answers'
+            },
+            options: { sort: { order: 1 } }
+          })
+          .lean();
+
+        if (quiz) {
+          trainingContent.push({
+            type: 'quiz',
+            _id: quiz._id,
+            title: quiz.title || 'Module Quiz',
+            moduleId: module._id,
+            moduleTitle: module.title,
+            order: module.order + 1000, // Place after sections
+            isFinalExam: false,
+            data: quiz
+          });
+        }
+      }
+    }
+
+    // Add final exam at the end
+    if (course.finalExam) {
+      const finalExam = typeof course.finalExam === 'object' 
+        ? course.finalExam 
+        : await Quiz.findById(course.finalExam)
+            .populate({
+              path: 'questions',
+              populate: {
+                path: 'answers'
+              },
+              options: { sort: { order: 1 } }
+            })
+            .lean();
+
+      if (finalExam) {
+        trainingContent.push({
+          type: 'finalExam',
+          _id: finalExam._id,
+          title: finalExam.title || 'Final Exam',
+          order: 9999, // Always last
+          isFinalExam: true,
+          data: finalExam
+        });
+      }
+    }
+
+    res.json({
+      course: {
+        _id: course._id,
+        title: course.title,
+        description: course.description,
+        thumbnail: course.thumbnail,
+        instructor: course.instructorId,
+        category: course.categoryId
+      },
+      trainingContent
+    });
+  } catch (error) {
+    console.error('Error fetching training content:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // PUT update a course
 router.put('/:id', isInstructor, async (req, res) => {
   try {

@@ -400,7 +400,7 @@ router.get('/forum', isInstructor, async (req, res) => {
         { authorId: instructorId }
       ]
     })
-      .populate('authorId', 'firstName lastName profileImage')
+      .populate('authorId', 'firstName lastName role profileImage')
       .populate('courseId', 'title')
       .sort({ createdAt: -1 })
       .lean();
@@ -415,6 +415,107 @@ router.get('/forum', isInstructor, async (req, res) => {
     res.json({ posts: transformedPosts });
   } catch (error) {
     console.error('Error fetching forum posts:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST change password
+router.post('/change-password', isInstructor, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ error: 'Current password and new password are required' });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters long' });
+    }
+
+    const user = await User.findById(req.user.userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Verify current password
+    const isMatch = await user.comparePassword(currentPassword);
+    if (!isMatch) {
+      return res.status(400).json({ error: 'Current password is incorrect' });
+    }
+
+    // Update password
+    user.password = newPassword;
+    await user.save();
+
+    res.json({ message: 'Password changed successfully' });
+  } catch (error) {
+    console.error('Error changing password:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// PUT update notification settings
+router.put('/notifications', isInstructor, async (req, res) => {
+  try {
+    const { emailNotifications, courseUpdates, studentMessages, marketingEmails } = req.body;
+    
+    // For now, just return success (notification settings can be stored in user model if needed)
+    // In a real app, you would save these to the database
+    res.json({ 
+      message: 'Notification settings updated successfully',
+      settings: {
+        emailNotifications: emailNotifications !== undefined ? emailNotifications : true,
+        courseUpdates: courseUpdates !== undefined ? courseUpdates : true,
+        studentMessages: studentMessages !== undefined ? studentMessages : true,
+        marketingEmails: marketingEmails !== undefined ? marketingEmails : false,
+      }
+    });
+  } catch (error) {
+    console.error('Error updating notification settings:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST upload file
+const multer = require('multer');
+const { uploadFileToGridFS } = require('../lib/gridfs');
+
+const storage = multer.memoryStorage();
+const upload = multer({ 
+  storage: storage,
+  limits: { fileSize: 50 * 1024 * 1024 } // 50MB
+});
+
+router.post('/upload', isInstructor, upload.single('file'), async (req, res) => {
+  try {
+    const file = req.file;
+    if (!file) {
+      return res.status(400).json({ error: 'No file provided' });
+    }
+
+    const timestamp = Date.now();
+    const sanitizedName = file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
+    const filename = `${timestamp}_${sanitizedName}`;
+    
+    const fileId = await uploadFileToGridFS(file.buffer, filename, {
+      originalName: file.originalname,
+      uploadedBy: req.user.userId,
+      uploadedAt: new Date(),
+      contentType: file.mimetype,
+      size: file.size,
+    });
+
+    const fileUrl = `/api/files/${fileId}`;
+    
+    res.status(200).json({ 
+      fileId,
+      fileUrl,
+      fileName: file.originalname,
+      fileSize: file.size,
+      fileType: file.mimetype
+    });
+  } catch (error) {
+    console.error('Error uploading file:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

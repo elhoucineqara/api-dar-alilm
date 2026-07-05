@@ -9,7 +9,17 @@ const QuestionSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ['qcm', 'true_false', 'multiple_correct'],
+      enum: [
+        'qcm',
+        'true_false',
+        'multiple_correct',
+        'single_choice',
+        'sequence',
+        'drag_drop',
+        'quiz_image',
+        'matching',
+        'fill_blank',
+      ],
       required: true,
     },
     quizId: {
@@ -26,6 +36,18 @@ const QuestionSchema = new mongoose.Schema(
       type: Number,
       required: true,
       default: 1,
+    },
+    imageId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'File',
+    },
+    imageUrl: {
+      type: String,
+      trim: true,
+    },
+    imageName: {
+      type: String,
+      trim: true,
     },
     answers: [{
       type: mongoose.Schema.Types.ObjectId,

@@ -1,25 +1,15 @@
-const { verifyToken } = require('../lib/jwt');
+const { requireAuthUser } = require('../lib/request-auth');
 
 // Middleware to authenticate token
-const authenticateToken = (req, res, next) => {
+const authenticateToken = async (req, res, next) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ 
-        success: false,
-        message: 'Unauthorized - No token provided' 
-      });
-    }
-
-    const token = authHeader.substring(7);
-    const decoded = verifyToken(token);
-    
-    req.user = decoded;
+    req.user = await requireAuthUser(req);
     next();
   } catch (error) {
-    return res.status(401).json({ 
+    const statusCode = error.statusCode || 401;
+    return res.status(statusCode).json({ 
       success: false,
-      message: 'Unauthorized - Invalid token',
+      message: statusCode === 403 ? error.message : 'Unauthorized - Invalid token',
       error: error.message 
     });
   }

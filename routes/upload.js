@@ -1,51 +1,24 @@
 const express = require('express');
 const router = express.Router();
-const multer = require('multer');
 const { uploadFileToGridFS } = require('../lib/gridfs');
-const { verifyToken } = require('../lib/jwt');
+const { requireCreatorUser } = require('../lib/creator-access');
+const {
+  ALL_EXTENSIONS,
+  createMemoryUpload,
+  getUploadErrorResponse,
+  validateUploadedFile,
+} = require('../lib/secure-upload');
 
-const storage = multer.memoryStorage();
-const upload = multer({ 
-  storage: storage,
-  limits: { fileSize: 50 * 1024 * 1024 } // 50MB (increased from 10MB)
-});
+const MAX_UPLOAD_SIZE = 250 * 1024 * 1024;
+const upload = createMemoryUpload(MAX_UPLOAD_SIZE);
 
-// Middleware to protect instructor routes
-const isInstructor = async (req, res, next) => {
-  try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const token = authHeader.substring(7);
-    const decoded = verifyToken(token);
-    if (decoded.role !== 'instructor') {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-
-    req.user = decoded;
-    next();
-  } catch (error) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-};
-
-router.post('/', isInstructor, (req, res, next) => {
-  // Use multer's upload middleware
+router.post('/', requireCreatorUser, (req, res, next) => {
   upload.single('file')(req, res, (err) => {
-    if (err instanceof multer.MulterError) {
-      // A Multer error occurred when uploading
-      if (err.code === 'LIMIT_FILE_SIZE') {
-        return res.status(400).json({ error: 'File too large. Maximum size is 50MB.' });
-      }
-      return res.status(400).json({ error: `Upload error: ${err.message}` });
-    } else if (err) {
-      // An unknown error occurred when uploading
+    if (err) {
       console.error('Unknown upload error:', err);
-      return res.status(500).json({ error: 'Internal server error during upload' });
+      const response = getUploadErrorResponse(err, '250MB');
+      return res.status(response.status).json(response.body);
     }
-    // Everything went fine, proceed to the actual handler
     next();
   });
 }, async (req, res) => {
@@ -55,16 +28,16 @@ router.post('/', isInstructor, (req, res, next) => {
       return res.status(400).json({ error: 'No file provided' });
     }
 
-    const timestamp = Date.now();
-    const sanitizedName = file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
-    const filename = `${timestamp}_${sanitizedName}`;
+    const metadata = validateUploadedFile(file, { allowedExtensions: ALL_EXTENSIONS });
     
-    const fileId = await uploadFileToGridFS(file.buffer, filename, {
-      originalName: file.originalname,
+    const fileId = await uploadFileToGridFS(file.buffer, metadata.storageName, {
+      originalName: metadata.originalName,
       uploadedBy: req.user.userId,
       uploadedAt: new Date(),
-      contentType: file.mimetype,
-      size: file.size,
+      contentType: metadata.contentType,
+      size: metadata.size,
+      extension: metadata.extension,
+      category: metadata.category,
     });
 
     console.log('File uploaded to GridFS with ID:', fileId);
@@ -74,13 +47,14 @@ router.post('/', isInstructor, (req, res, next) => {
     res.status(200).json({ 
       fileId,
       fileUrl,
-      fileName: file.originalname,
-      fileSize: file.size,
-      fileType: file.mimetype
+      fileName: metadata.originalName,
+      fileSize: metadata.size,
+      fileType: metadata.contentType
     });
   } catch (error) {
     console.error('Error uploading file:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    const response = getUploadErrorResponse(error, '250MB');
+    res.status(response.status).json(response.body);
   }
 });
 

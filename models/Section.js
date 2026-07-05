@@ -18,7 +18,7 @@ const SectionSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ['file', 'youtube'],
+      enum: ['file', 'youtube', 'video', 'article', 'quiz'],
       required: true,
     },
     order: {
@@ -37,10 +37,18 @@ const SectionSchema = new mongoose.Schema(
     },
     fileType: {
       type: String,
-      enum: ['pdf', 'word', 'ppt'],
+      enum: ['pdf', 'word', 'ppt', 'video'],
     },
     youtubeUrl: {
       type: String,
+    },
+    articleContent: {
+      type: String,
+      trim: true,
+    },
+    quizId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Quiz',
     },
   },
   {

@@ -2,22 +2,15 @@ const express = require('express');
 const router = express.Router();
 const ForumPost = require('../models/ForumPost');
 const User = require('../models/User');
-const { verifyToken } = require('../lib/jwt');
+const { requireAuthUser } = require('../lib/request-auth');
 
 // Middleware to verify authentication
-const isAuthenticated = (req, res, next) => {
+const isAuthenticated = async (req, res, next) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const token = authHeader.substring(7);
-    const decoded = verifyToken(token);
-    req.user = decoded;
+    req.user = await requireAuthUser(req);
     next();
   } catch (error) {
-    return res.status(401).json({ error: 'Unauthorized' });
+    return res.status(error.statusCode || 401).json({ error: error.message || 'Unauthorized' });
   }
 };
 

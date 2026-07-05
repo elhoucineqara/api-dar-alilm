@@ -2,11 +2,12 @@ const express = require('express');
 const router = express.Router();
 const Course = require('../models/Course');
 const Module = require('../models/Module');
+const Section = require('../models/Section');
 const Quiz = require('../models/Quiz');
 const Question = require('../models/Question');
 const Answer = require('../models/Answer');
 const Enrollment = require('../models/Enrollment');
-const { verifyToken } = require('../lib/jwt');
+const { getAuthContextFromToken } = require('../lib/request-auth');
 
 // GET a single quiz by ID (requires authentication - checks enrollment for students or ownership for instructors)
 router.get('/:id', async (req, res) => {
@@ -20,9 +21,10 @@ router.get('/:id', async (req, res) => {
     }
 
     const token = authHeader.substring(7);
-    let decoded;
+    let authUser;
     try {
-      decoded = verifyToken(token);
+      const context = await getAuthContextFromToken(token);
+      authUser = context.authUser;
     } catch (error) {
       return res.status(401).json({ error: 'Invalid token' });
     }
@@ -67,10 +69,21 @@ router.get('/:id', async (req, res) => {
         courseId = module.courseId.toString();
         course = await Course.findById(module.courseId).lean();
       } else {
-        // Check if it's a final exam
-        course = await Course.findOne({ finalExam: quizId }).lean();
-        if (course) {
-          courseId = course._id.toString();
+        const section = await Section.findOne({ quizId }).lean();
+        if (section) {
+          const sectionModule = await Module.findById(section.moduleId).lean();
+          if (sectionModule) {
+            courseId = sectionModule.courseId.toString();
+            course = await Course.findById(sectionModule.courseId).lean();
+          }
+        }
+
+        if (!course) {
+          // Check if it's a final exam
+          course = await Course.findOne({ finalExam: quizId }).lean();
+          if (course) {
+            courseId = course._id.toString();
+          }
         }
       }
     }
@@ -80,19 +93,25 @@ router.get('/:id', async (req, res) => {
     }
 
     // Check authorization
-    if (decoded.role === 'instructor') {
+    if (authUser.role === 'admin') {
+      // Admins can inspect any quiz on the platform
+    } else if (authUser.role === 'instructor') {
       // Instructors can only access quizzes for their own courses
-      if (course.instructorId.toString() !== decoded.userId) {
+      if (course.instructorId.toString() !== authUser.userId) {
         return res.status(403).json({ error: 'Forbidden: You do not own this course' });
       }
-    } else if (decoded.role === 'student') {
+    } else if (authUser.role === 'student') {
       // Students can only access quizzes for courses they're enrolled in
       const enrollment = await Enrollment.findOne({
-        userId: decoded.userId,
+        userId: authUser.userId,
         courseId: course._id
       }).lean();
       
       if (!enrollment) {
+        if (course.status !== 'published' || course.enrollmentOpen === false) {
+          return res.status(404).json({ error: 'Quiz not found' });
+        }
+
         // Check if course is free
         if (course.price && course.price > 0) {
           return res.status(403).json({ error: 'Forbidden: You must be enrolled in this course' });

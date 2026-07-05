@@ -2,31 +2,10 @@ const express = require('express');
 const router = express.Router();
 const Course = require('../models/Course');
 const Module = require('../models/Module');
-const { verifyToken } = require('../lib/jwt');
-
-// Middleware to protect instructor routes
-const isInstructor = async (req, res, next) => {
-  try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const token = authHeader.substring(7);
-    const decoded = verifyToken(token);
-    if (decoded.role !== 'instructor') {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-
-    req.user = decoded;
-    next();
-  } catch (error) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-};
+const { requireCreatorUser } = require('../lib/creator-access');
 
 // GET all modules for a course
-router.get('/:courseId', isInstructor, async (req, res) => {
+router.get('/:courseId', requireCreatorUser, async (req, res) => {
   try {
     const { courseId } = req.params;
 
@@ -48,7 +27,7 @@ router.get('/:courseId', isInstructor, async (req, res) => {
 });
 
 // POST create a new module
-router.post('/:courseId', isInstructor, async (req, res) => {
+router.post('/:courseId', requireCreatorUser, async (req, res) => {
   try {
     const { courseId } = req.params;
     const { title, description, order } = req.body;
@@ -85,7 +64,7 @@ router.post('/:courseId', isInstructor, async (req, res) => {
 });
 
 // PUT update a module
-router.put('/:moduleId', isInstructor, async (req, res) => {
+router.put('/:moduleId', requireCreatorUser, async (req, res) => {
   try {
     const { moduleId } = req.params;
     const { title, description, order } = req.body;
@@ -114,7 +93,7 @@ router.put('/:moduleId', isInstructor, async (req, res) => {
 });
 
 // DELETE a module
-router.delete('/:moduleId', isInstructor, async (req, res) => {
+router.delete('/:moduleId', requireCreatorUser, async (req, res) => {
   try {
     const { moduleId } = req.params;
 

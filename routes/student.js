@@ -8,35 +8,177 @@ const User = require('../models/User');
 const Section = require('../models/Section');
 const Module = require('../models/Module');
 const Quiz = require('../models/Quiz');
+const QuizAttempt = require('../models/QuizAttempt');
 const Certificate = require('../models/Certificate');
-const { verifyToken } = require('../lib/jwt');
-const multer = require('multer');
+const { requireAuthUser } = require('../lib/request-auth');
 const { uploadFileToGridFS } = require('../lib/gridfs');
+const { ensureEnrollmentAndProgress } = require('../lib/course-enrollment');
+const {
+  IMAGE_EXTENSIONS,
+  createMemoryUpload,
+  getUploadErrorResponse,
+  validateUploadedFile,
+} = require('../lib/secure-upload');
 
 // Configure multer for file upload
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
-});
+const upload = createMemoryUpload(5 * 1024 * 1024);
 
-// Middleware to protect student routes
-const isStudent = (req, res, next) => {
-  try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Unauthorized' });
+function idSet(values = []) {
+  return new Set(values.map((value) => String(value)));
+}
+
+async function getQuizCourseContext(quizId) {
+  const quiz = await Quiz.findById(quizId)
+    .populate({
+      path: 'questions',
+      populate: { path: 'answers' },
+      options: { sort: { order: 1 } },
+    })
+    .lean();
+
+  if (!quiz) {
+    return null;
+  }
+
+  const finalExamCourse = await Course.findOne({ finalExam: quizId }).lean();
+  if (finalExamCourse) {
+    return {
+      quiz,
+      course: finalExamCourse,
+      courseId: finalExamCourse._id,
+      moduleId: null,
+      isFinalExam: true,
+    };
+  }
+
+  const module = await Module.findOne({ quiz: quizId }).lean();
+  if (!module) {
+    const section = await Section.findOne({ quizId }).lean();
+    if (section) {
+      const sectionModule = await Module.findById(section.moduleId).lean();
+      const sectionCourse = sectionModule ? await Course.findById(sectionModule.courseId).lean() : null;
+      return {
+        quiz,
+        course: sectionCourse,
+        courseId: sectionModule?.courseId || quiz.courseId || null,
+        moduleId: sectionModule?._id || quiz.moduleId || null,
+        isFinalExam: false,
+      };
     }
 
-    const token = authHeader.substring(7);
-    const decoded = verifyToken(token);
-    if (decoded.role !== 'student') {
+    return {
+      quiz,
+      course: null,
+      courseId: quiz.courseId || null,
+      moduleId: quiz.moduleId || null,
+      isFinalExam: Boolean(quiz.isFinalExam),
+    };
+  }
+
+  const course = await Course.findById(module.courseId).lean();
+  return {
+    quiz,
+    course,
+    courseId: module.courseId,
+    moduleId: module._id,
+    isFinalExam: false,
+  };
+}
+
+async function loadQuizWithQuestions(quizId) {
+  if (!quizId) return null;
+
+  return Quiz.findById(quizId)
+    .populate({
+      path: 'questions',
+      populate: { path: 'answers' },
+      options: { sort: { order: 1 } },
+    })
+    .lean();
+}
+
+async function recalculateProgress(progress, courseId) {
+  const course = await Course.findById(courseId).lean();
+  const modules = await Module.find({ courseId }).lean();
+
+  let totalSections = 0;
+  let totalQuizzes = 0;
+  let completedSectionsCount = 0;
+  let completedQuizzesCount = 0;
+  const moduleQuizIds = new Set();
+  const contentSectionIds = new Set();
+
+  for (const mod of modules) {
+    const sections = await Section.find({ moduleId: mod._id }).select('_id type quizId').lean();
+    for (const section of sections) {
+      if (section.type === 'quiz' && section.quizId) {
+        totalQuizzes += 1;
+        moduleQuizIds.add(String(section.quizId));
+      } else {
+        totalSections += 1;
+        contentSectionIds.add(String(section._id));
+      }
+    }
+
+    if (mod.quiz) {
+      totalQuizzes += 1;
+      moduleQuizIds.add(String(mod.quiz));
+    }
+  }
+
+  completedSectionsCount = progress.completedSections.filter((sectionId) =>
+    contentSectionIds.has(String(sectionId))
+  ).length;
+  progress.completedSections = progress.completedSections.filter((sectionId) =>
+    contentSectionIds.has(String(sectionId))
+  );
+
+  completedQuizzesCount = progress.completedQuizzes.filter((quizId) =>
+    moduleQuizIds.has(String(quizId))
+  ).length;
+  progress.completedQuizzes = progress.completedQuizzes.filter((quizId) =>
+    moduleQuizIds.has(String(quizId))
+  );
+
+  if (course?.finalExam) {
+    totalQuizzes += 1;
+    if (progress.completedFinalExam) completedQuizzesCount += 1;
+  }
+
+  const totalItems = totalSections + totalQuizzes;
+  const completedItems = completedSectionsCount + completedQuizzesCount;
+
+  progress.overallProgress = totalItems > 0
+    ? Math.round((completedItems / totalItems) * 100)
+    : 0;
+  progress.lastAccessedAt = new Date();
+
+  await progress.save();
+
+  if (progress.overallProgress === 100) {
+    const enrollment = await Enrollment.findOne({ userId: progress.userId, courseId });
+    if (enrollment && enrollment.status === 'active') {
+      enrollment.status = 'completed';
+      enrollment.completedAt = new Date();
+      await enrollment.save();
+    }
+  }
+
+  return progress;
+}
+
+// Middleware to protect student routes
+const isStudent = async (req, res, next) => {
+  try {
+    const authUser = await requireAuthUser(req);
+    if (authUser.role !== 'student') {
       return res.status(403).json({ error: 'Forbidden: Only students can access this' });
     }
 
-    req.user = decoded;
+    req.user = authUser;
     next();
   } catch (error) {
-    return res.status(401).json({ error: 'Unauthorized' });
+    return res.status(error.statusCode || 401).json({ error: error.message || 'Unauthorized' });
   }
 };
 
@@ -167,12 +309,29 @@ router.get('/progress', isStudent, async (req, res) => {
             quiz = await Quiz.findById(module.quiz).lean();
           }
 
+          const sectionsWithProgress = await Promise.all(
+            sections.map(async (section) => {
+              if (section.type === 'quiz' && section.quizId) {
+                const sectionQuiz = await loadQuizWithQuestions(section.quizId);
+                return {
+                  ...section,
+                  quiz: sectionQuiz,
+                  completed: progress.completedQuizzes?.some(
+                    (id) => id.toString() === section.quizId.toString()
+                  ) || false,
+                };
+              }
+
+              return {
+                ...section,
+                completed: progress.completedSections?.some((id) => id.toString() === section._id.toString()) || false,
+              };
+            })
+          );
+
           return {
             ...module,
-            sections: sections.map((section) => ({
-              ...section,
-              completed: progress.completedSections?.some((id) => id.toString() === section._id.toString()) || false,
-            })),
+            sections: sectionsWithProgress,
             quiz: quiz ? {
               ...quiz,
               completed: progress.completedQuizzes?.some((id) => id.toString() === quiz._id.toString()) || false,
@@ -212,20 +371,21 @@ router.get('/progress', isStudent, async (req, res) => {
 router.get('/courses/:courseId/training', async (req, res) => {
   try {
     const { courseId } = req.params;
-    
-    // Try to get user from token (optional for free courses)
+
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Please log in with a student account to access this course' });
+    }
+
     let userId = null;
     try {
-      const authHeader = req.headers.authorization;
-      if (authHeader && authHeader.startsWith('Bearer ')) {
-        const token = authHeader.substring(7);
-        const decoded = verifyToken(token);
-        if (decoded.role === 'student') {
-          userId = decoded.userId;
-        }
+      const authUser = await requireAuthUser(req);
+      if (authUser.role !== 'student') {
+        return res.status(403).json({ error: 'Forbidden: Only students can access this course' });
       }
+      userId = authUser.userId;
     } catch (e) {
-      // Token invalid or missing - allow access for free courses
+      return res.status(401).json({ error: 'Please log in with a student account to access this course' });
     }
 
     // Get course to check if it's free
@@ -235,17 +395,18 @@ router.get('/courses/:courseId/training', async (req, res) => {
     }
 
     const isFree = !course.price || course.price === 0;
+    const enrollment = await Enrollment.findOne({
+      userId,
+      courseId,
+    }).lean();
 
-    // Check enrollment only for paid courses
-    if (!isFree && userId) {
-      const enrollment = await Enrollment.findOne({
-        userId,
-        courseId,
-      }).lean();
+    if (course.status !== 'published') {
+      return res.status(404).json({ error: 'Course not found' });
+    }
 
-      if (!enrollment) {
-        return res.status(403).json({ error: 'Not enrolled in this course' });
-      }
+    // Paid courses and closed courses require an existing enrollment.
+    if ((!isFree || course.enrollmentOpen === false) && !enrollment) {
+      return res.status(403).json({ error: 'Not enrolled in this course' });
     }
 
     // Get course with full populate
@@ -299,6 +460,27 @@ router.get('/courses/:courseId/training', async (req, res) => {
         .lean();
 
       for (const section of sections) {
+        if (section.type === 'quiz' && section.quizId) {
+          const sectionQuiz = await loadQuizWithQuestions(section.quizId);
+          if (sectionQuiz) {
+            trainingContent.push({
+              type: 'quiz',
+              _id: sectionQuiz._id,
+              title: section.title || sectionQuiz.title || 'Quiz',
+              moduleId: module._id,
+              moduleTitle: module.title,
+              order: section.order,
+              completed: progress?.completedQuizzes?.some(
+                (id) => id.toString() === sectionQuiz._id.toString()
+              ) || false,
+              isFinalExam: false,
+              sectionId: section._id,
+              data: sectionQuiz,
+            });
+            continue;
+          }
+        }
+
         trainingContent.push({
           type: 'section',
           _id: section._id,
@@ -430,60 +612,52 @@ router.put('/progress', isStudent, async (req, res) => {
     if (sectionId) {
       progress.sectionId = sectionId;
       progress.quizId = undefined;
-      if (!progress.completedSections.includes(sectionId)) {
+      if (!progress.completedSections.some((id) => String(id) === String(sectionId))) {
         progress.completedSections.push(sectionId);
       }
     }
     if (quizId) {
+      const passedAttempt = await QuizAttempt.exists({
+        userId: req.user.userId,
+        courseId,
+        quizId,
+        passed: true,
+      });
+
+      if (!passedAttempt) {
+        return res.status(403).json({ error: 'Quiz must be passed before it can be marked complete.' });
+      }
+
       progress.quizId = quizId;
       progress.sectionId = undefined;
-      if (!progress.completedQuizzes.includes(quizId)) {
+      if (!progress.completedQuizzes.some((id) => String(id) === String(quizId))) {
         progress.completedQuizzes.push(quizId);
       }
     }
 
     if (completedFinalExam !== undefined) {
+      if (completedFinalExam) {
+        const course = await Course.findById(courseId).select('finalExam').lean();
+        const finalExamId = course?.finalExam;
+        const passedAttempt = finalExamId
+          ? await QuizAttempt.exists({
+            userId: req.user.userId,
+            courseId,
+            quizId: finalExamId,
+            passed: true,
+          })
+          : null;
+
+        if (!passedAttempt) {
+          return res.status(403).json({ error: 'Final exam must be passed before it can be marked complete.' });
+        }
+      }
+
       progress.completedFinalExam = completedFinalExam;
       if (completedFinalExam) progress.quizId = undefined;
     }
 
-    // Calculate overall progress
-    const course = await Course.findById(courseId).lean();
-    const modules = await Module.find({ courseId }).lean();
-    
-    let totalSections = 0;
-    let totalQuizzes = 0;
-    let completedSectionsCount = progress.completedSections.length;
-    let completedQuizzesCount = progress.completedQuizzes.length;
-
-    for (const mod of modules) {
-      totalSections += await Section.countDocuments({ moduleId: mod._id });
-      if (mod.quiz) totalQuizzes += 1;
-    }
-
-    if (course?.finalExam) {
-      totalQuizzes += 1;
-      if (progress.completedFinalExam) completedQuizzesCount += 1;
-    }
-
-    const totalItems = totalSections + totalQuizzes;
-    const completedItems = completedSectionsCount + completedQuizzesCount;
-    
-    progress.overallProgress = totalItems > 0 
-      ? Math.round((completedItems / totalItems) * 100) 
-      : 0;
-
-    progress.lastAccessedAt = new Date();
-    await progress.save();
-
-    if (progress.overallProgress === 100) {
-      const enrollment = await Enrollment.findOne({ userId: req.user.userId, courseId });
-      if (enrollment && enrollment.status === 'active') {
-        enrollment.status = 'completed';
-        enrollment.completedAt = new Date();
-        await enrollment.save();
-      }
-    }
+    await recalculateProgress(progress, courseId);
 
     res.json({ message: 'Progress updated successfully', progress });
   } catch (error) {
@@ -553,29 +727,23 @@ router.post('/enroll', isStudent, async (req, res) => {
       return res.status(400).json({ error: 'Already enrolled in this course' });
     }
 
-    // Create enrollment
-    const enrollment = new Enrollment({
+    if (course.status !== 'published' || course.enrollmentOpen === false) {
+      return res.status(404).json({ error: 'Course not available for enrollment' });
+    }
+
+    if (course.price && course.price > 0) {
+      return res.status(402).json({
+        error: 'Payment required for this course',
+        requiresPurchase: true,
+        courseId,
+        redirectTo: `/courses/${courseId}`,
+      });
+    }
+
+    const { enrollment } = await ensureEnrollmentAndProgress({
       userId,
       courseId,
-      enrolledAt: new Date(),
-      status: 'active',
     });
-
-    await enrollment.save();
-
-    // Create initial progress
-    const progress = new Progress({
-      userId,
-      courseId,
-      enrollmentId: enrollment._id,
-      completedSections: [],
-      completedQuizzes: [],
-      completedFinalExam: false,
-      overallProgress: 0,
-      lastAccessedAt: new Date(),
-    });
-
-    await progress.save();
 
     res.status(201).json({ message: 'Enrolled successfully', enrollment });
   } catch (error) {
@@ -641,23 +809,31 @@ router.put('/notifications', isStudent, async (req, res) => {
 });
 
 // POST upload file
-router.post('/upload', isStudent, upload.single('file'), async (req, res) => {
+router.post('/upload', isStudent, (req, res, next) => {
+  upload.single('file')(req, res, (err) => {
+    if (err) {
+      const response = getUploadErrorResponse(err, '5MB');
+      return res.status(response.status).json(response.body);
+    }
+    next();
+  });
+}, async (req, res) => {
   try {
     const file = req.file;
     if (!file) {
       return res.status(400).json({ error: 'No file provided' });
     }
 
-    const timestamp = Date.now();
-    const sanitizedName = file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
-    const filename = `${timestamp}_${sanitizedName}`;
+    const metadata = validateUploadedFile(file, { allowedExtensions: IMAGE_EXTENSIONS });
     
-    const fileId = await uploadFileToGridFS(file.buffer, filename, {
-      originalName: file.originalname,
+    const fileId = await uploadFileToGridFS(file.buffer, metadata.storageName, {
+      originalName: metadata.originalName,
       uploadedBy: req.user.userId,
       uploadedAt: new Date(),
-      contentType: file.mimetype,
-      size: file.size,
+      contentType: metadata.contentType,
+      size: metadata.size,
+      extension: metadata.extension,
+      category: metadata.category,
     });
 
     const fileUrl = `/api/files/${fileId}`;
@@ -665,13 +841,14 @@ router.post('/upload', isStudent, upload.single('file'), async (req, res) => {
     res.status(200).json({ 
       fileId,
       fileUrl,
-      fileName: file.originalname,
-      fileSize: file.size,
-      fileType: file.mimetype
+      fileName: metadata.originalName,
+      fileSize: metadata.size,
+      fileType: metadata.contentType
     });
   } catch (error) {
     console.error('Error uploading file:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    const response = getUploadErrorResponse(error, '5MB');
+    res.status(response.status).json(response.body);
   }
 });
 
@@ -868,9 +1045,15 @@ router.get('/quizzes/:quizId', isStudent, async (req, res) => {
       courseId = courseByFinalExam._id;
     } else {
       // Check if it's a module quiz
-      const module = await Module.findOne({ quizId: quizId }).lean();
+      const module = await Module.findOne({ quiz: quizId }).lean();
       if (module) {
         courseId = module.courseId;
+      } else {
+        const section = await Section.findOne({ quizId }).lean();
+        if (section) {
+          const sectionModule = await Module.findById(section.moduleId).lean();
+          courseId = sectionModule?.courseId || null;
+        }
       }
     }
 
@@ -894,6 +1077,158 @@ router.get('/quizzes/:quizId', isStudent, async (req, res) => {
   } catch (error) {
     console.error('Error fetching quiz:', error);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST submit a quiz attempt and score it server-side
+router.post('/quizzes/:quizId/attempts', isStudent, async (req, res) => {
+  try {
+    const { quizId } = req.params;
+    const { answers = [] } = req.body || {};
+    const userId = req.user.userId;
+    const context = await getQuizCourseContext(quizId);
+
+    if (!context?.quiz || !context.courseId) {
+      return res.status(404).json({ error: 'Quiz not found' });
+    }
+
+    const enrollment = await Enrollment.findOne({
+      userId,
+      courseId: context.courseId,
+    });
+
+    if (!enrollment) {
+      return res.status(403).json({ error: 'Not enrolled in this course' });
+    }
+
+    if (!Array.isArray(answers)) {
+      return res.status(400).json({ error: 'Answers must be an array.' });
+    }
+
+    const submittedByQuestionId = new Map(
+      answers.map((answer) => [String(answer?.questionId || ''), answer || {}])
+    );
+    const scoredAnswers = [];
+    let pointsAwarded = 0;
+    let pointsPossible = 0;
+
+    for (const question of context.quiz.questions || []) {
+      const questionId = String(question._id);
+      const submittedAnswer = submittedByQuestionId.get(questionId) || {};
+      const submittedAnswerIds = Array.isArray(submittedAnswer.answerIds)
+        ? submittedAnswer.answerIds.map((answerId) => String(answerId))
+        : submittedAnswer.answerId
+          ? [String(submittedAnswer.answerId)]
+          : [];
+      const submittedSet = idSet(submittedAnswerIds);
+      const correctAnswerIds = (question.answers || [])
+        .filter((answer) => answer.isCorrect)
+        .map((answer) => String(answer._id));
+      const correctSet = idSet(correctAnswerIds);
+      const possible = Number(question.points || 1);
+      let correct = false;
+
+      if (question.type === 'multiple_correct') {
+        correct =
+          submittedSet.size === correctSet.size &&
+          [...correctSet].every((answerId) => submittedSet.has(answerId));
+      } else if (
+        question.type === 'qcm' ||
+        question.type === 'single_choice' ||
+        question.type === 'true_false' ||
+        question.type === 'quiz_image'
+      ) {
+        correct = submittedSet.size === 1 && correctSet.has([...submittedSet][0]);
+      } else if (question.type === 'sequence' || question.type === 'drag_drop' || question.type === 'matching') {
+        const expectedOrder = [...(question.answers || [])]
+          .sort((a, b) => Number(a.order || 0) - Number(b.order || 0))
+          .map((answer) => String(answer._id));
+        correct =
+          submittedAnswerIds.length === expectedOrder.length &&
+          expectedOrder.every((answerId, index) => submittedAnswerIds[index] === answerId);
+      } else if (question.type === 'fill_blank') {
+        const submittedText = String(submittedAnswer.textAnswer || '').trim().toLowerCase();
+        correct = (question.answers || []).some(
+          (answer) => answer.isCorrect && String(answer.answer || '').trim().toLowerCase() === submittedText
+        );
+      }
+
+      const awarded = correct ? possible : 0;
+      pointsPossible += possible;
+      pointsAwarded += awarded;
+      scoredAnswers.push({
+        questionId: question._id,
+        answerIds: submittedAnswerIds,
+        textAnswer:
+          typeof submittedAnswer.textAnswer === 'string' ? submittedAnswer.textAnswer : undefined,
+        correct,
+        pointsAwarded: awarded,
+        pointsPossible: possible,
+      });
+    }
+
+    const score =
+      pointsPossible > 0 ? Math.round((pointsAwarded / pointsPossible) * 100) : 0;
+    const passed = score >= Number(context.quiz.passingScore || 60);
+
+    const attempt = await QuizAttempt.create({
+      userId,
+      quizId,
+      courseId: context.courseId,
+      moduleId: context.moduleId || undefined,
+      isFinalExam: context.isFinalExam,
+      answers: scoredAnswers,
+      score,
+      pointsAwarded,
+      pointsPossible,
+      passed,
+    });
+
+    let progress = await Progress.findOne({
+      userId,
+      courseId: context.courseId,
+    });
+
+    if (!progress) {
+      progress = new Progress({
+        userId,
+        courseId: context.courseId,
+        enrollmentId: enrollment._id,
+        completedSections: [],
+        completedQuizzes: [],
+        completedFinalExam: false,
+        overallProgress: 0,
+      });
+    }
+
+    if (passed) {
+      if (context.isFinalExam) {
+        progress.completedFinalExam = true;
+        progress.quizId = undefined;
+      } else {
+        progress.quizId = quizId;
+        progress.sectionId = undefined;
+        if (!progress.completedQuizzes.some((id) => String(id) === String(quizId))) {
+          progress.completedQuizzes.push(quizId);
+        }
+      }
+    }
+
+    await recalculateProgress(progress, context.courseId);
+
+    return res.json({
+      attempt: {
+        _id: attempt._id,
+        score,
+        passed,
+        pointsAwarded,
+        pointsPossible,
+      },
+      progress,
+    });
+  } catch (error) {
+    console.error('Error submitting quiz attempt:', error);
+    return res.status(500).json({ error: 'Internal server error' });
   }
 });
 

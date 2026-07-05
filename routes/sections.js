@@ -3,31 +3,47 @@ const router = express.Router();
 const Module = require('../models/Module');
 const Section = require('../models/Section');
 const Course = require('../models/Course');
-const { verifyToken } = require('../lib/jwt');
+const Quiz = require('../models/Quiz');
+const Question = require('../models/Question');
+const Answer = require('../models/Answer');
+const { requireCreatorUser } = require('../lib/creator-access');
 
-// Middleware to protect instructor routes
-const isInstructor = (req, res, next) => {
-  try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
+async function createSectionQuiz({ moduleId, title, description, passingScore, timeLimit }) {
+  const quiz = new Quiz({
+    title,
+    description,
+    moduleId,
+    isFinalExam: false,
+    passingScore: passingScore || 60,
+    timeLimit,
+    questions: [],
+    totalPoints: 0,
+  });
 
-    const token = authHeader.substring(7);
-    const decoded = verifyToken(token);
-    if (decoded.role !== 'instructor') {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
+  await quiz.save();
+  return quiz;
+}
 
-    req.user = decoded;
-    next();
-  } catch (error) {
-    return res.status(401).json({ error: 'Unauthorized' });
+async function deleteQuizIfOnlyUsedBySection(quizId) {
+  if (!quizId) return;
+
+  const [otherSection, legacyModule] = await Promise.all([
+    Section.findOne({ quizId }),
+    Module.findOne({ quiz: quizId }),
+  ]);
+
+  if (otherSection || legacyModule) return;
+
+  const questions = await Question.find({ quizId });
+  for (const question of questions) {
+    await Answer.deleteMany({ questionId: question._id });
+    await Question.findByIdAndDelete(question._id);
   }
-};
+  await Quiz.findByIdAndDelete(quizId);
+}
 
 // GET all sections for a module
-router.get('/module/:moduleId', isInstructor, async (req, res) => {
+router.get('/module/:moduleId', requireCreatorUser, async (req, res) => {
   try {
     const { moduleId } = req.params;
     const module = await Module.findById(moduleId);
@@ -49,7 +65,7 @@ router.get('/module/:moduleId', isInstructor, async (req, res) => {
 });
 
 // POST create a new section
-router.post('/module/:moduleId', isInstructor, async (req, res) => {
+router.post('/module/:moduleId', requireCreatorUser, async (req, res) => {
   try {
     const { moduleId } = req.params;
     const module = await Module.findById(moduleId);
@@ -62,7 +78,23 @@ router.post('/module/:moduleId', isInstructor, async (req, res) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    const { title, description, type, order, fileId, fileUrl, fileName, fileType, youtubeUrl } = req.body;
+    const {
+      title,
+      description,
+      type,
+      order,
+      fileId,
+      fileUrl,
+      fileName,
+      fileType,
+      youtubeUrl,
+      articleContent,
+      quizId,
+      quizTitle,
+      quizDescription,
+      passingScore,
+      timeLimit,
+    } = req.body;
 
     if (!title || !type) {
       return res.status(400).json({ error: 'Title and type are required' });
@@ -70,17 +102,31 @@ router.post('/module/:moduleId', isInstructor, async (req, res) => {
 
     const sectionOrder = order !== undefined ? order : module.sections.length;
 
+    let resolvedQuizId = quizId;
+    if (type === 'quiz' && !resolvedQuizId) {
+      const quiz = await createSectionQuiz({
+        moduleId,
+        title: quizTitle || title,
+        description: quizDescription || description,
+        passingScore,
+        timeLimit,
+      });
+      resolvedQuizId = quiz._id;
+    }
+
     const section = new Section({
       title,
       description,
       moduleId,
       type,
       order: sectionOrder,
-      fileId: type === 'file' ? fileId : undefined,
-      fileUrl: type === 'file' ? fileUrl : undefined,
-      fileName: type === 'file' ? fileName : undefined,
-      fileType: type === 'file' ? fileType : undefined,
+      fileId: type === 'file' || type === 'video' ? fileId : undefined,
+      fileUrl: type === 'file' || type === 'video' ? fileUrl : undefined,
+      fileName: type === 'file' || type === 'video' ? fileName : undefined,
+      fileType: type === 'video' ? 'video' : type === 'file' ? fileType : undefined,
       youtubeUrl: type === 'youtube' ? youtubeUrl : undefined,
+      articleContent: type === 'article' ? articleContent : undefined,
+      quizId: type === 'quiz' ? resolvedQuizId : undefined,
     });
 
     await section.save();
@@ -95,8 +141,55 @@ router.post('/module/:moduleId', isInstructor, async (req, res) => {
   }
 });
 
+// PUT reorder sections inside a module
+router.put('/module/:moduleId/reorder', requireCreatorUser, async (req, res) => {
+  try {
+    const { moduleId } = req.params;
+    const { sectionIds } = req.body;
+
+    if (!Array.isArray(sectionIds) || sectionIds.length === 0) {
+      return res.status(400).json({ error: 'sectionIds must be a non-empty array' });
+    }
+
+    const module = await Module.findById(moduleId);
+    if (!module) {
+      return res.status(404).json({ error: 'Module not found' });
+    }
+
+    const course = await Course.findOne({ _id: module.courseId, instructorId: req.user.userId });
+    if (!course) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    const moduleSectionIds = module.sections.map((id) => id.toString());
+    const requestedSectionIds = sectionIds.map((id) => id.toString());
+    const hasSameSections =
+      requestedSectionIds.length === moduleSectionIds.length &&
+      requestedSectionIds.every((id) => moduleSectionIds.includes(id));
+
+    if (!hasSameSections) {
+      return res.status(400).json({ error: 'sectionIds must contain exactly the module sections' });
+    }
+
+    module.sections = requestedSectionIds;
+    await module.save();
+
+    await Promise.all(
+      requestedSectionIds.map((sectionId, index) =>
+        Section.findByIdAndUpdate(sectionId, { order: index })
+      )
+    );
+
+    const sections = await Section.find({ moduleId }).sort({ order: 1 });
+    res.json({ sections });
+  } catch (error) {
+    console.error('Error reordering sections:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // GET a single section
-router.get('/:id', isInstructor, async (req, res) => {
+router.get('/:id', requireCreatorUser, async (req, res) => {
   try {
     const section = await Section.findById(req.params.id);
     if (!section) {
@@ -117,7 +210,7 @@ router.get('/:id', isInstructor, async (req, res) => {
 });
 
 // PUT update a section
-router.put('/:id', isInstructor, async (req, res) => {
+router.put('/:id', requireCreatorUser, async (req, res) => {
   try {
     const section = await Section.findById(req.params.id);
     if (!section) {
@@ -130,9 +223,28 @@ router.put('/:id', isInstructor, async (req, res) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    const { title, description, type, order, fileId, fileUrl, fileName, fileType, youtubeUrl } = req.body;
+    const {
+      title,
+      description,
+      type,
+      order,
+      fileId,
+      fileUrl,
+      fileName,
+      fileType,
+      youtubeUrl,
+      articleContent,
+      quizId,
+      quizTitle,
+      quizDescription,
+      passingScore,
+      timeLimit,
+    } = req.body;
 
     const updateData = {};
+    const unsetData = {};
+    const oldQuizId = section.type === 'quiz' ? section.quizId : null;
+
     if (title) updateData.title = title;
     if (description !== undefined) updateData.description = description;
     if (type) updateData.type = type;
@@ -142,12 +254,66 @@ router.put('/:id', isInstructor, async (req, res) => {
     if (fileName !== undefined) updateData.fileName = fileName;
     if (fileType !== undefined) updateData.fileType = fileType;
     if (youtubeUrl !== undefined) updateData.youtubeUrl = youtubeUrl;
+    if (articleContent !== undefined) updateData.articleContent = articleContent;
+    if (quizId !== undefined) updateData.quizId = quizId;
+
+    if (type === 'video') {
+      updateData.fileType = 'video';
+      unsetData.youtubeUrl = '';
+      unsetData.articleContent = '';
+      unsetData.quizId = '';
+    } else if (type === 'file') {
+      unsetData.youtubeUrl = '';
+      unsetData.articleContent = '';
+      unsetData.quizId = '';
+    } else if (type === 'youtube') {
+      unsetData.fileId = '';
+      unsetData.fileUrl = '';
+      unsetData.fileName = '';
+      unsetData.fileType = '';
+      unsetData.articleContent = '';
+      unsetData.quizId = '';
+    } else if (type === 'article') {
+      unsetData.fileId = '';
+      unsetData.fileUrl = '';
+      unsetData.fileName = '';
+      unsetData.fileType = '';
+      unsetData.youtubeUrl = '';
+      unsetData.quizId = '';
+    } else if (type === 'quiz') {
+      unsetData.fileId = '';
+      unsetData.fileUrl = '';
+      unsetData.fileName = '';
+      unsetData.fileType = '';
+      unsetData.youtubeUrl = '';
+      unsetData.articleContent = '';
+
+      if (!updateData.quizId && !section.quizId) {
+        const quiz = await createSectionQuiz({
+          moduleId: section.moduleId,
+          title: quizTitle || title || section.title,
+          description: quizDescription || description || section.description,
+          passingScore,
+          timeLimit,
+        });
+        updateData.quizId = quiz._id;
+      }
+    }
+
+    const shouldDeleteOldQuiz = oldQuizId && (
+      (type && type !== 'quiz') ||
+      (quizId !== undefined && String(quizId) !== String(oldQuizId))
+    );
 
     const updatedSection = await Section.findByIdAndUpdate(
       req.params.id,
-      updateData,
+      Object.keys(unsetData).length > 0 ? { $set: updateData, $unset: unsetData } : updateData,
       { new: true, runValidators: true }
     );
+
+    if (shouldDeleteOldQuiz) {
+      await deleteQuizIfOnlyUsedBySection(oldQuizId);
+    }
 
     res.json({ section: updatedSection });
   } catch (error) {
@@ -157,7 +323,7 @@ router.put('/:id', isInstructor, async (req, res) => {
 });
 
 // DELETE a section
-router.delete('/:id', isInstructor, async (req, res) => {
+router.delete('/:id', requireCreatorUser, async (req, res) => {
   try {
     const section = await Section.findById(req.params.id);
     if (!section) {
@@ -173,7 +339,9 @@ router.delete('/:id', isInstructor, async (req, res) => {
     module.sections = module.sections.filter((s) => s.toString() !== req.params.id);
     await module.save();
 
+    const quizIdToDelete = section.type === 'quiz' ? section.quizId : null;
     await Section.findByIdAndDelete(req.params.id);
+    await deleteQuizIfOnlyUsedBySection(quizIdToDelete);
 
     res.json({ message: 'Section deleted successfully' });
   } catch (error) {

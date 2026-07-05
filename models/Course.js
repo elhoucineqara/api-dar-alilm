@@ -17,6 +17,10 @@ const CourseSchema = new mongoose.Schema(
       ref: 'Category',
       required: true,
     },
+    requestedCategoryId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Category',
+    },
     instructorId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
@@ -26,6 +30,18 @@ const CourseSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
+    stripeProductId: {
+      type: String,
+    },
+    stripePriceId: {
+      type: String,
+    },
+    stripeAccountId: {
+      type: String,
+    },
+    paymentCurrency: {
+      type: String,
+    },
     thumbnail: {
       type: String,
     },
@@ -33,6 +49,10 @@ const CourseSchema = new mongoose.Schema(
       type: String,
       enum: ['draft', 'published'],
       default: 'draft',
+    },
+    enrollmentOpen: {
+      type: Boolean,
+      default: true,
     },
     modules: [{
       type: mongoose.Schema.Types.ObjectId,

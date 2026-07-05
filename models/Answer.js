@@ -7,6 +7,10 @@ const AnswerSchema = new mongoose.Schema(
       required: [true, 'Answer text is required'],
       trim: true,
     },
+    matchText: {
+      type: String,
+      trim: true,
+    },
     questionId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Question',

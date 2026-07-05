@@ -1,38 +1,240 @@
 const express = require('express');
+const multer = require('multer');
 const router = express.Router();
 const User = require('../models/User');
 const Course = require('../models/Course');
 const Category = require('../models/Category');
 const Enrollment = require('../models/Enrollment');
-const { verifyToken } = require('../lib/jwt');
+const {
+  createStripeOnboardingLink,
+  syncStripeConnectedAccount,
+} = require('../lib/marketplace-stripe');
+const {
+  getPayPalReturnRedirectUrl,
+} = require('../lib/paypal-marketplace');
+const { requireCreatorUser } = require('../lib/creator-access');
+const { getAdminContactEmailTemplate, sendEmail } = require('../lib/email');
+const { getPlatformSettings, serializePlatformSettings } = require('../lib/platform-settings');
+const { serializeUserPaymentSettings } = require('../lib/user-payment-settings');
+const { uploadFileToGridFS } = require('../lib/gridfs');
+const {
+  ALL_EXTENSIONS,
+  IMAGE_EXTENSIONS,
+  createMemoryUpload,
+  getUploadErrorResponse,
+  validateUploadedFile,
+} = require('../lib/secure-upload');
 
 const Module = require('../models/Module');
 const Section = require('../models/Section');
 const Progress = require('../models/Progress');
 
-// Middleware to protect instructor routes
-const isInstructor = (req, res, next) => {
-  try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
+const courseContentUpload = createMemoryUpload(50 * 1024 * 1024);
 
-    const token = authHeader.substring(7);
-    const decoded = verifyToken(token);
-    if (decoded.role !== 'instructor') {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
+const instructorEmailUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024,
+    files: 16,
+  },
+});
 
-    req.user = decoded;
-    next();
-  } catch (error) {
-    return res.status(401).json({ error: 'Unauthorized' });
+function getDisplayName(user) {
+  const fullName = `${user?.firstName || ''} ${user?.lastName || ''}`.trim();
+  return fullName || user?.email || 'User';
+}
+
+function parseJsonArray(value) {
+  if (typeof value !== 'string' || !value.trim()) {
+    return [];
   }
-};
+
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseInstructorEmailPayload(req) {
+  const subject = String(req.body?.subject || '').trim();
+  const message = typeof req.body?.message === 'string' ? req.body.message : '';
+  const messageHtml = typeof req.body?.html === 'string' ? req.body.html : '';
+  const inlineImageMeta = parseJsonArray(req.body?.inlineImageMeta);
+  const attachmentFiles = Array.isArray(req.files?.attachments) ? req.files.attachments : [];
+  const inlineImageFiles = Array.isArray(req.files?.inlineImages) ? req.files.inlineImages : [];
+  const attachments = attachmentFiles.map((file) => {
+    const metadata = validateUploadedFile(file, { allowedExtensions: ALL_EXTENSIONS });
+    return {
+      filename: metadata.originalName,
+      content: file.buffer,
+      contentType: metadata.contentType,
+    };
+  });
+  const inlineImages = inlineImageFiles.map((file, index) => {
+    const metadata = validateUploadedFile(file, { allowedExtensions: IMAGE_EXTENSIONS });
+    return {
+      filename: metadata.originalName,
+      content: file.buffer,
+      contentType: metadata.contentType,
+      cid:
+        typeof inlineImageMeta[index]?.cid === 'string' && inlineImageMeta[index].cid.trim()
+          ? inlineImageMeta[index].cid.trim()
+          : `inline-image-${Date.now()}-${index}`,
+    };
+  });
+
+  return {
+    subject,
+    message,
+    messageHtml,
+    attachments: [...attachments, ...inlineImages],
+  };
+}
+
+function normalizeIdList(value) {
+  const rawIds = Array.isArray(value) ? value : parseJsonArray(value);
+
+  return [
+    ...new Set(
+      rawIds
+        .map((id) => String(id || '').trim())
+        .filter((id) => /^[a-f\d]{24}$/i.test(id))
+    ),
+  ];
+}
+
+function parseBooleanParam(value) {
+  return value === 'true' || value === true || value === '1';
+}
+
+function getPayPalMerchantIdFromReturn(query = {}) {
+  return (
+    (typeof query.merchantIdInPayPal === 'string' && query.merchantIdInPayPal.trim()) ||
+    (typeof query.merchant_id === 'string' && query.merchant_id.trim()) ||
+    null
+  );
+}
+
+router.get('/payment-settings/paypal/return', async (req, res) => {
+  try {
+    const trackingId =
+      (typeof req.query.merchantId === 'string' && req.query.merchantId.trim()) ||
+      (typeof req.query.tracking_id === 'string' && req.query.tracking_id.trim()) ||
+      null;
+
+    if (!trackingId) {
+      return res.redirect(getPayPalReturnRedirectUrl('error', 'Missing PayPal tracking id.'));
+    }
+
+    const user = await User.findOne({
+      'paymentSettings.paypalMerchant.trackingId': trackingId,
+    });
+
+    if (!user) {
+      return res.redirect(getPayPalReturnRedirectUrl('error', 'PayPal onboarding session not found.'));
+    }
+
+    const merchantId = getPayPalMerchantIdFromReturn(req.query);
+    const permissionsGranted =
+      parseBooleanParam(req.query.permissionsGranted) || parseBooleanParam(req.query.consentStatus);
+    const accountStatus =
+      (typeof req.query.accountStatus === 'string' && req.query.accountStatus.trim()) || null;
+    const emailConfirmed = parseBooleanParam(req.query.primaryEmailConfirmed);
+    const frontendReturnPath =
+      user.paymentSettings?.paypalMerchant?.frontendReturnPath || '/instructor/payments';
+
+    user.paymentSettings = user.paymentSettings || {};
+    user.paymentSettings.paypalMerchant = {
+      ...(user.paymentSettings.paypalMerchant || {}),
+      merchantId: merchantId || user.paymentSettings.paypalMerchant?.merchantId,
+      accountStatus,
+      onboardingStatus: merchantId && permissionsGranted ? 'linked' : 'needs_attention',
+      permissionsGranted,
+      paymentsReceivable: permissionsGranted,
+      primaryEmailConfirmed: emailConfirmed || permissionsGranted,
+      connectedAt:
+        user.paymentSettings.paypalMerchant?.connectedAt ||
+        (merchantId ? new Date() : undefined),
+      lastSyncedAt: new Date(),
+    };
+
+    await user.save();
+
+    return res.redirect(
+      getPayPalReturnRedirectUrl(
+        merchantId && permissionsGranted ? 'connected' : 'needs_attention',
+        merchantId && permissionsGranted
+          ? 'PayPal account connected successfully.'
+          : 'PayPal onboarding still needs attention.',
+        {
+          frontendReturnPath,
+        }
+      )
+    );
+  } catch (error) {
+    console.error('Error handling PayPal instructor return:', error);
+    return res.redirect(getPayPalReturnRedirectUrl('error', 'PayPal onboarding failed.'));
+  }
+});
+
+router.get('/payment-settings', requireCreatorUser, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    if (user.paymentSettings?.stripeConnect?.accountId) {
+      await syncStripeConnectedAccount(user);
+    }
+
+    const platformSettings = await getPlatformSettings();
+
+    return res.json({
+      paymentSettings: serializeUserPaymentSettings(user),
+      platform: serializePlatformSettings(platformSettings),
+    });
+  } catch (error) {
+    console.error('Error fetching instructor payment settings:', error);
+    return res.status(500).json({ error: error.message || 'Internal server error' });
+  }
+});
+
+router.post('/payment-settings/stripe/onboarding-link', requireCreatorUser, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const onboarding = await createStripeOnboardingLink(user);
+    return res.json(onboarding);
+  } catch (error) {
+    console.error('Error creating Stripe onboarding link:', error);
+    return res.status(error.statusCode || 500).json({
+      error: error.message || 'Unable to start Stripe onboarding.',
+    });
+  }
+});
+
+router.post('/payment-settings/paypal/onboarding-link', requireCreatorUser, async (req, res) => {
+  try {
+    return res.status(400).json({
+      error:
+        'PayPal is not used for instructor revenue anymore. Instructors should connect Stripe only.',
+    });
+  } catch (error) {
+    console.error('Error creating PayPal onboarding link:', error);
+    return res.status(error.statusCode || 500).json({
+      error: error.message || 'Unable to start PayPal onboarding.',
+    });
+  }
+});
 
 // PUT update instructor profile
-router.put('/profile', isInstructor, async (req, res) => {
+router.put('/profile', requireCreatorUser, async (req, res) => {
   try {
     const { firstName, lastName, email, phone, bio, profileImage } = req.body;
     
@@ -71,7 +273,7 @@ router.put('/profile', isInstructor, async (req, res) => {
 });
 
 // GET all categories for the instructor
-router.get('/categories', isInstructor, async (req, res) => {
+router.get('/categories', requireCreatorUser, async (req, res) => {
   try {
     const categories = await Category.find({ instructorId: req.user.userId }).sort({ createdAt: -1 });
     res.json({ categories });
@@ -82,7 +284,7 @@ router.get('/categories', isInstructor, async (req, res) => {
 });
 
 // POST create a new category
-router.post('/categories', isInstructor, async (req, res) => {
+router.post('/categories', requireCreatorUser, async (req, res) => {
   try {
     const { name, description } = req.body;
     if (!name) {
@@ -107,7 +309,7 @@ router.post('/categories', isInstructor, async (req, res) => {
 });
 
 // PUT update a category
-router.put('/categories/:id', isInstructor, async (req, res) => {
+router.put('/categories/:id', requireCreatorUser, async (req, res) => {
   try {
     const { name, description } = req.body;
     const categoryId = req.params.id;
@@ -136,7 +338,7 @@ router.put('/categories/:id', isInstructor, async (req, res) => {
 });
 
 // DELETE a category
-router.delete('/categories/:id', isInstructor, async (req, res) => {
+router.delete('/categories/:id', requireCreatorUser, async (req, res) => {
   try {
     const categoryId = req.params.id;
 
@@ -162,7 +364,7 @@ router.delete('/categories/:id', isInstructor, async (req, res) => {
 });
 
 // GET instructor statistics
-router.get('/statistics', isInstructor, async (req, res) => {
+router.get('/statistics', requireCreatorUser, async (req, res) => {
   try {
     const instructorId = req.user.userId;
 
@@ -192,7 +394,7 @@ router.get('/statistics', isInstructor, async (req, res) => {
 });
 
 // GET all students for the instructor's courses
-router.get('/students', isInstructor, async (req, res) => {
+router.get('/students', requireCreatorUser, async (req, res) => {
   try {
     const instructorId = req.user.userId;
     const { courseId } = req.query;
@@ -206,7 +408,9 @@ router.get('/students', isInstructor, async (req, res) => {
     }
 
     const enrollments = await Enrollment.find(enrollmentQuery).populate('userId');
-    const studentIds = [...new Set(enrollments.map((e) => e.userId._id.toString()))];
+    const studentIds = [
+      ...new Set(enrollments.map((e) => e.userId?._id?.toString()).filter(Boolean)),
+    ];
 
     const studentsData = await Promise.all(
       studentIds.map(async (studentId) => {
@@ -214,8 +418,13 @@ router.get('/students', isInstructor, async (req, res) => {
         if (!student) return null;
 
         const studentEnrollments = enrollments.filter(
-          (e) => e.userId._id.toString() === studentId
+          (e) => e.userId?._id?.toString() === studentId
         );
+        const studentCourseIds = studentEnrollments.map((enrollment) => enrollment.courseId);
+        const enrollmentDates = studentEnrollments
+          .map((enrollment) => enrollment.enrolledAt)
+          .filter(Boolean)
+          .sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
 
         const progressData = await Promise.all(
           studentEnrollments.map(async (enrollment) => {
@@ -232,7 +441,10 @@ router.get('/students', isInstructor, async (req, res) => {
             ? progressData.reduce((sum, p) => sum + p, 0) / progressData.length
             : 0;
 
-        const lastProgress = await Progress.findOne({ userId: studentId })
+        const lastProgress = await Progress.findOne({
+          userId: studentId,
+          courseId: { $in: studentCourseIds },
+        })
           .sort({ lastAccessedAt: -1 })
           .select('lastAccessedAt');
 
@@ -243,7 +455,9 @@ router.get('/students', isInstructor, async (req, res) => {
           email: student.email,
           enrolledCourses: studentEnrollments.length,
           totalProgress: Math.round(totalProgress),
-          lastActive: lastProgress?.lastAccessedAt || student.createdAt,
+          lastActive: lastProgress?.lastAccessedAt || null,
+          createdAt: student.createdAt,
+          firstEnrolledAt: enrollmentDates[0] || null,
         };
       })
     );
@@ -261,8 +475,129 @@ router.get('/students', isInstructor, async (req, res) => {
   }
 });
 
+// POST contact selected students enrolled in the instructor's courses
+router.post(
+  '/students/contact',
+  requireCreatorUser,
+  instructorEmailUpload.fields([
+    { name: 'attachments', maxCount: 8 },
+    { name: 'inlineImages', maxCount: 12 },
+  ]),
+  async (req, res) => {
+    try {
+      const requestedStudentIds = normalizeIdList(req.body?.userIds);
+      const { subject, message, messageHtml, attachments } = parseInstructorEmailPayload(req);
+
+      if (requestedStudentIds.length === 0) {
+        return res.status(400).json({
+          error: 'Select at least one student to contact.',
+        });
+      }
+
+      if (!subject || (!messageHtml.trim() && !String(message || '').trim())) {
+        return res.status(400).json({
+          error: 'Subject and email content are required.',
+        });
+      }
+
+      const instructorId = req.user.userId;
+      const instructorCourses = await Course.find({ instructorId }).select('_id').lean();
+      const courseIds = instructorCourses.map((course) => course._id);
+
+      if (courseIds.length === 0) {
+        return res.status(400).json({
+          error: 'You need at least one course before contacting students.',
+        });
+      }
+
+      const eligibleEnrollments = await Enrollment.find({
+        courseId: { $in: courseIds },
+        userId: { $in: requestedStudentIds },
+      })
+        .select('userId')
+        .lean();
+      const eligibleStudentIds = [
+        ...new Set(eligibleEnrollments.map((enrollment) => String(enrollment.userId))),
+      ];
+
+      const students = await User.find({
+        _id: { $in: eligibleStudentIds },
+        role: 'student',
+        email: { $exists: true, $ne: '' },
+      })
+        .select('firstName lastName email')
+        .lean();
+
+      if (students.length === 0) {
+        return res.status(400).json({
+          error: 'No eligible students found for your courses.',
+        });
+      }
+
+      const [instructorUser, settings] = await Promise.all([
+        User.findById(instructorId).select('firstName lastName email').lean(),
+        getPlatformSettings(),
+      ]);
+      const serializedSettings = serializePlatformSettings(settings);
+      const senderEmail = instructorUser?.email || serializedSettings.supportEmail;
+      const emailResults = await Promise.all(
+        students.map(async (student) => {
+          const result = await sendEmail({
+            to: student.email,
+            subject,
+            html: getAdminContactEmailTemplate({
+              platformName: serializedSettings.platformName,
+              recipientName: getDisplayName(student),
+              adminName: getDisplayName(instructorUser || {}),
+              subject,
+              message: String(message || '').trim(),
+              messageHtml,
+              senderContext: "l'espace instructeur",
+              supportEmail: senderEmail,
+            }),
+            attachments,
+          });
+
+          return {
+            userId: String(student._id),
+            email: student.email,
+            success: result.success,
+            error: result.error || null,
+          };
+        })
+      );
+
+      const sent = emailResults.filter((result) => result.success);
+      const failed = emailResults.filter((result) => !result.success);
+      const skippedCount = requestedStudentIds.length - students.length;
+
+      if (sent.length === 0) {
+        return res.status(500).json({
+          error: failed[0]?.error || 'Unable to send email.',
+          failed,
+          skippedCount,
+        });
+      }
+
+      return res.json({
+        message: `${sent.length} email(s) sent.${failed.length ? ` ${failed.length} failed.` : ''}${
+          skippedCount > 0 ? ` ${skippedCount} skipped.` : ''
+        }`,
+        sentCount: sent.length,
+        failed,
+        skippedCount,
+      });
+    } catch (error) {
+      console.error('Error contacting instructor students:', error);
+      return res.status(error.statusCode || 400).json({
+        error: error.message || 'Unable to send email.',
+      });
+    }
+  }
+);
+
 // GET detailed student data for an instructor
-router.get('/students/:id', isInstructor, async (req, res) => {
+router.get('/students/:id', requireCreatorUser, async (req, res) => {
   try {
     const studentId = req.params.id;
     const instructorId = req.user.userId;
@@ -302,7 +637,7 @@ router.get('/students/:id', isInstructor, async (req, res) => {
           completedQuizzes: progress?.completedQuizzes?.length || 0,
           totalQuizzes,
           completedFinalExam: progress?.completedFinalExam || false,
-          lastAccessedAt: progress?.lastAccessedAt || enrollment.enrolledAt,
+          lastAccessedAt: progress?.lastAccessedAt || null,
           enrolledAt: enrollment.enrolledAt,
         };
       })
@@ -325,7 +660,7 @@ router.get('/students/:id', isInstructor, async (req, res) => {
 });
 
 // GET analytics data for instructor
-router.get('/analytics', isInstructor, async (req, res) => {
+router.get('/analytics', requireCreatorUser, async (req, res) => {
   try {
     const instructorId = req.user.userId;
 
@@ -382,7 +717,7 @@ router.get('/analytics', isInstructor, async (req, res) => {
 });
 
 // GET forum posts for instructor's courses
-router.get('/forum', isInstructor, async (req, res) => {
+router.get('/forum', requireCreatorUser, async (req, res) => {
   try {
     const instructorId = req.user.userId;
 
@@ -420,7 +755,7 @@ router.get('/forum', isInstructor, async (req, res) => {
 });
 
 // POST change password
-router.post('/change-password', isInstructor, async (req, res) => {
+router.post('/change-password', requireCreatorUser, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
     
@@ -455,7 +790,7 @@ router.post('/change-password', isInstructor, async (req, res) => {
 });
 
 // PUT update notification settings
-router.put('/notifications', isInstructor, async (req, res) => {
+router.put('/notifications', requireCreatorUser, async (req, res) => {
   try {
     const { emailNotifications, courseUpdates, studentMessages, marketingEmails } = req.body;
     
@@ -477,32 +812,31 @@ router.put('/notifications', isInstructor, async (req, res) => {
 });
 
 // POST upload file
-const multer = require('multer');
-const { uploadFileToGridFS } = require('../lib/gridfs');
-
-const storage = multer.memoryStorage();
-const upload = multer({ 
-  storage: storage,
-  limits: { fileSize: 50 * 1024 * 1024 } // 50MB
-});
-
-router.post('/upload', isInstructor, upload.single('file'), async (req, res) => {
+router.post('/upload', requireCreatorUser, (req, res, next) => {
+  courseContentUpload.single('file')(req, res, (err) => {
+    if (err) {
+      const response = getUploadErrorResponse(err, '50MB');
+      return res.status(response.status).json(response.body);
+    }
+    next();
+  });
+}, async (req, res) => {
   try {
     const file = req.file;
     if (!file) {
       return res.status(400).json({ error: 'No file provided' });
     }
 
-    const timestamp = Date.now();
-    const sanitizedName = file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
-    const filename = `${timestamp}_${sanitizedName}`;
+    const metadata = validateUploadedFile(file, { allowedExtensions: ALL_EXTENSIONS });
     
-    const fileId = await uploadFileToGridFS(file.buffer, filename, {
-      originalName: file.originalname,
+    const fileId = await uploadFileToGridFS(file.buffer, metadata.storageName, {
+      originalName: metadata.originalName,
       uploadedBy: req.user.userId,
       uploadedAt: new Date(),
-      contentType: file.mimetype,
-      size: file.size,
+      contentType: metadata.contentType,
+      size: metadata.size,
+      extension: metadata.extension,
+      category: metadata.category,
     });
 
     const fileUrl = `/api/files/${fileId}`;
@@ -510,13 +844,14 @@ router.post('/upload', isInstructor, upload.single('file'), async (req, res) => 
     res.status(200).json({ 
       fileId,
       fileUrl,
-      fileName: file.originalname,
-      fileSize: file.size,
-      fileType: file.mimetype
+      fileName: metadata.originalName,
+      fileSize: metadata.size,
+      fileType: metadata.contentType
     });
   } catch (error) {
     console.error('Error uploading file:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    const response = getUploadErrorResponse(error, '50MB');
+    res.status(response.status).json(response.body);
   }
 });
 

@@ -5,28 +5,74 @@ const Quiz = require('../models/Quiz');
 const Question = require('../models/Question');
 const Answer = require('../models/Answer');
 const Course = require('../models/Course');
-const { verifyToken } = require('../lib/jwt');
+const { requireCreatorUser } = require('../lib/creator-access');
 
-// Middleware to protect instructor routes
-const isInstructor = (req, res, next) => {
-  try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
+function getSanitizedQuestionFields(body) {
+  const { question, type, points, imageId, imageUrl, imageName } = body;
+  return {
+    question,
+    type,
+    points: points || 1,
+    imageId: imageId || undefined,
+    imageUrl: imageUrl || undefined,
+    imageName: imageName || undefined,
+  };
+}
 
-    const token = authHeader.substring(7);
-    const decoded = verifyToken(token);
-    if (decoded.role !== 'instructor') {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-
-    req.user = decoded;
-    next();
-  } catch (error) {
-    return res.status(401).json({ error: 'Unauthorized' });
+async function createQuestionWithAnswers(quizId, payload, order = 0) {
+  const { question, type, points, imageId, imageUrl, imageName } = getSanitizedQuestionFields(payload);
+  if (!question || !type) {
+    throw new Error('Question and type are required');
   }
-};
+
+  const newQuestion = new Question({
+    question,
+    type,
+    points: points || 1,
+    quizId,
+    order,
+    imageId,
+    imageUrl,
+    imageName,
+    answers: [],
+  });
+
+  await newQuestion.save();
+
+  const answers = Array.isArray(payload.answers) ? payload.answers : [];
+  for (let index = 0; index < answers.length; index += 1) {
+    const answerPayload = answers[index];
+    const newAnswer = new Answer({
+      answer: answerPayload.answer || answerPayload.text,
+      matchText: answerPayload.matchText || answerPayload.right || undefined,
+      isCorrect: Boolean(answerPayload.isCorrect),
+      order: answerPayload.order !== undefined ? answerPayload.order : index,
+      questionId: newQuestion._id,
+    });
+    await newAnswer.save();
+    newQuestion.answers.push(newAnswer._id);
+  }
+
+  await newQuestion.save();
+
+  const quiz = await Quiz.findById(quizId);
+  if (quiz) {
+    quiz.questions.push(newQuestion._id);
+    quiz.totalPoints += newQuestion.points;
+    await quiz.save();
+  }
+
+  return newQuestion;
+}
+
+async function deleteQuestionWithAnswers(questionId) {
+  const question = await Question.findById(questionId);
+  if (!question) return null;
+
+  await Answer.deleteMany({ questionId });
+  await Question.findByIdAndDelete(questionId);
+  return question;
+}
 
 // --- Module Quizzes ---
 
@@ -56,7 +102,7 @@ router.get('/:id', async (req, res) => {
 });
 
 // GET quiz for a module
-router.get('/module/:moduleId', isInstructor, async (req, res) => {
+router.get('/module/:moduleId', requireCreatorUser, async (req, res) => {
   try {
     const module = await Module.findById(req.params.moduleId).populate('quiz');
     if (!module) {
@@ -85,7 +131,7 @@ router.get('/module/:moduleId', isInstructor, async (req, res) => {
 });
 
 // POST create or update quiz for a module
-router.post('/module/:moduleId', isInstructor, async (req, res) => {
+router.post('/module/:moduleId', requireCreatorUser, async (req, res) => {
   try {
     const module = await Module.findById(req.params.moduleId);
     if (!module) {
@@ -138,7 +184,7 @@ router.post('/module/:moduleId', isInstructor, async (req, res) => {
 });
 
 // DELETE quiz for a module
-router.delete('/module/:moduleId', isInstructor, async (req, res) => {
+router.delete('/module/:moduleId', requireCreatorUser, async (req, res) => {
   try {
     const module = await Module.findById(req.params.moduleId);
     if (!module) {
@@ -177,7 +223,7 @@ router.delete('/module/:moduleId', isInstructor, async (req, res) => {
 // --- Final Exams ---
 
 // GET final exam for a course
-router.get('/course/:courseId/final-exam', isInstructor, async (req, res) => {
+router.get('/course/:courseId/final-exam', requireCreatorUser, async (req, res) => {
   try {
     const course = await Course.findOne({ _id: req.params.courseId, instructorId: req.user.userId }).populate('finalExam');
     if (!course) {
@@ -201,7 +247,7 @@ router.get('/course/:courseId/final-exam', isInstructor, async (req, res) => {
 });
 
 // POST create or update final exam for a course
-router.post('/course/:courseId/final-exam', isInstructor, async (req, res) => {
+router.post('/course/:courseId/final-exam', requireCreatorUser, async (req, res) => {
   try {
     const course = await Course.findOne({ _id: req.params.courseId, instructorId: req.user.userId });
     if (!course) {
@@ -249,7 +295,7 @@ router.post('/course/:courseId/final-exam', isInstructor, async (req, res) => {
 });
 
 // DELETE final exam
-router.delete('/course/:courseId/final-exam', isInstructor, async (req, res) => {
+router.delete('/course/:courseId/final-exam', requireCreatorUser, async (req, res) => {
   try {
     const course = await Course.findOne({ _id: req.params.courseId, instructorId: req.user.userId });
     if (!course) {
@@ -283,9 +329,11 @@ router.delete('/course/:courseId/final-exam', isInstructor, async (req, res) => 
 // --- Questions ---
 
 // GET questions for a quiz
-router.get('/:quizId/questions', isInstructor, async (req, res) => {
+router.get('/:quizId/questions', requireCreatorUser, async (req, res) => {
   try {
-    const questions = await Question.find({ quizId: req.params.quizId }).populate('answers').sort({ createdAt: 1 });
+    const questions = await Question.find({ quizId: req.params.quizId })
+      .populate({ path: 'answers', options: { sort: { order: 1 } } })
+      .sort({ order: 1, createdAt: 1 });
     res.json({ questions });
   } catch (error) {
     console.error('Error fetching questions:', error);
@@ -293,19 +341,120 @@ router.get('/:quizId/questions', isInstructor, async (req, res) => {
   }
 });
 
-// POST create a question
-router.post('/:quizId/questions', isInstructor, async (req, res) => {
+// GET quiz questions as an importable JSON payload
+router.get('/:quizId/export', requireCreatorUser, async (req, res) => {
   try {
-    const { question, type, points } = req.body;
+    const quiz = await Quiz.findById(req.params.quizId).lean();
+    if (!quiz) {
+      return res.status(404).json({ error: 'Quiz not found' });
+    }
+
+    const questions = await Question.find({ quizId: req.params.quizId })
+      .sort({ order: 1, createdAt: 1 })
+      .lean();
+
+    const payloadQuestions = await Promise.all(questions.map(async (question) => {
+      const answers = await Answer.find({ questionId: question._id }).sort({ order: 1 }).lean();
+      return {
+        question: question.question,
+        type: question.type,
+        points: question.points,
+        imageUrl: question.imageUrl,
+        imageName: question.imageName,
+        answers: answers.map((answer) => ({
+          answer: answer.answer,
+          matchText: answer.matchText,
+          isCorrect: answer.isCorrect,
+          order: answer.order,
+        })),
+      };
+    }));
+
+    res.json({
+      version: 1,
+      quiz: {
+        title: quiz.title,
+        description: quiz.description,
+        passingScore: quiz.passingScore,
+        timeLimit: quiz.timeLimit,
+      },
+      questions: payloadQuestions,
+      template: {
+        question: 'Classer les étapes HTTP dans le bon ordre',
+        type: 'sequence',
+        points: 1,
+        answers: [
+          { answer: 'Le client envoie une requête', isCorrect: true, order: 0 },
+          { answer: 'Le serveur traite la demande', isCorrect: true, order: 1 },
+          { answer: 'Le serveur envoie une réponse', isCorrect: true, order: 2 },
+        ],
+      },
+    });
+  } catch (error) {
+    console.error('Error exporting quiz questions:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST import quiz questions from a JSON payload
+router.post('/:quizId/import', requireCreatorUser, async (req, res) => {
+  try {
+    const quiz = await Quiz.findById(req.params.quizId);
+    if (!quiz) {
+      return res.status(404).json({ error: 'Quiz not found' });
+    }
+
+    const mode = req.body.mode === 'replace' ? 'replace' : 'append';
+    const questions = Array.isArray(req.body.questions) ? req.body.questions : [];
+    if (questions.length === 0) {
+      return res.status(400).json({ error: 'questions must be a non-empty array' });
+    }
+
+    if (mode === 'replace') {
+      const existingQuestions = await Question.find({ quizId: quiz._id });
+      for (const existingQuestion of existingQuestions) {
+        await deleteQuestionWithAnswers(existingQuestion._id);
+      }
+      quiz.questions = [];
+      quiz.totalPoints = 0;
+      await quiz.save();
+    }
+
+    const currentCount = await Question.countDocuments({ quizId: quiz._id });
+    const createdQuestions = [];
+    for (let index = 0; index < questions.length; index += 1) {
+      createdQuestions.push(await createQuestionWithAnswers(quiz._id, questions[index], currentCount + index));
+    }
+
+    res.status(201).json({
+      message: `${createdQuestions.length} question(s) imported`,
+      count: createdQuestions.length,
+    });
+  } catch (error) {
+    console.error('Error importing quiz questions:', error);
+    res.status(500).json({ error: error.message || 'Internal server error' });
+  }
+});
+
+// POST create a question
+router.post('/:quizId/questions', requireCreatorUser, async (req, res) => {
+  try {
+    const { question, type, points, imageId, imageUrl, imageName } = req.body;
     if (!question || !type) {
       return res.status(400).json({ error: 'Question and type are required' });
     }
+
+    const questionCount = await Question.countDocuments({ quizId: req.params.quizId });
 
     const newQuestion = new Question({
       question,
       type,
       points: points || 1,
       quizId: req.params.quizId,
+      order: questionCount,
+      imageId: imageId || undefined,
+      imageUrl: imageUrl || undefined,
+      imageName: imageName || undefined,
       answers: [],
     });
 
@@ -328,7 +477,7 @@ router.post('/:quizId/questions', isInstructor, async (req, res) => {
 // --- Question Management (PUT, DELETE) ---
 
 // GET a single question
-router.get('/question/:id', isInstructor, async (req, res) => {
+router.get('/question/:id', requireCreatorUser, async (req, res) => {
     try {
         const question = await Question.findById(req.params.id).populate('answers');
         if (!question) {
@@ -341,12 +490,12 @@ router.get('/question/:id', isInstructor, async (req, res) => {
 });
 
 // PUT update a question
-router.put('/question/:id', isInstructor, async (req, res) => {
+router.put('/question/:id', requireCreatorUser, async (req, res) => {
     try {
-        const { question, type, points } = req.body;
+        const { question, type, points, imageId, imageUrl, imageName } = req.body;
         const updatedQuestion = await Question.findByIdAndUpdate(
             req.params.id,
-            { question, type, points },
+            { question, type, points, imageId, imageUrl, imageName },
             { new: true }
         );
         res.json({ question: updatedQuestion });
@@ -356,7 +505,7 @@ router.put('/question/:id', isInstructor, async (req, res) => {
 });
 
 // DELETE a question
-router.delete('/question/:id', isInstructor, async (req, res) => {
+router.delete('/question/:id', requireCreatorUser, async (req, res) => {
     try {
         const question = await Question.findById(req.params.id);
         if (question) {
@@ -378,11 +527,21 @@ router.delete('/question/:id', isInstructor, async (req, res) => {
 // --- Answers ---
 
 // POST create an answer
-router.post('/question/:questionId/answers', isInstructor, async (req, res) => {
+router.post('/question/:questionId/answers', requireCreatorUser, async (req, res) => {
   try {
-    const { answer, isCorrect, order } = req.body;
+    const { answer, isCorrect, order, matchText } = req.body;
+    const question = await Question.findById(req.params.questionId);
+    if (!question) {
+      return res.status(404).json({ error: 'Question not found' });
+    }
+
+    if (isCorrect && ['qcm', 'single_choice', 'true_false', 'quiz_image'].includes(question.type)) {
+      await Answer.updateMany({ questionId: req.params.questionId }, { isCorrect: false });
+    }
+
     const newAnswer = new Answer({
       answer,
+      matchText,
       isCorrect,
       order: order || 0,
       questionId: req.params.questionId,
@@ -390,11 +549,8 @@ router.post('/question/:questionId/answers', isInstructor, async (req, res) => {
 
     await newAnswer.save();
 
-    const question = await Question.findById(req.params.questionId);
-    if (question) {
-      question.answers.push(newAnswer._id);
-      await question.save();
-    }
+    question.answers.push(newAnswer._id);
+    await question.save();
 
     res.status(201).json({ answer: newAnswer });
   } catch (error) {
@@ -404,12 +560,22 @@ router.post('/question/:questionId/answers', isInstructor, async (req, res) => {
 });
 
 // PUT update an answer
-router.put('/answer/:id', isInstructor, async (req, res) => {
+router.put('/answer/:id', requireCreatorUser, async (req, res) => {
     try {
-        const { answer, isCorrect, order } = req.body;
+        const { answer, isCorrect, order, matchText } = req.body;
+        const existingAnswer = await Answer.findById(req.params.id);
+        if (!existingAnswer) {
+          return res.status(404).json({ error: 'Answer not found' });
+        }
+
+        const question = await Question.findById(existingAnswer.questionId);
+        if (isCorrect && question && ['qcm', 'single_choice', 'true_false', 'quiz_image'].includes(question.type)) {
+          await Answer.updateMany({ questionId: question._id, _id: { $ne: req.params.id } }, { isCorrect: false });
+        }
+
         const updatedAnswer = await Answer.findByIdAndUpdate(
             req.params.id,
-            { answer, isCorrect, order },
+            { answer, isCorrect, order, matchText },
             { new: true }
         );
         res.json({ answer: updatedAnswer });
@@ -419,7 +585,7 @@ router.put('/answer/:id', isInstructor, async (req, res) => {
 });
 
 // DELETE an answer
-router.delete('/answer/:id', isInstructor, async (req, res) => {
+router.delete('/answer/:id', requireCreatorUser, async (req, res) => {
     try {
         const answer = await Answer.findById(req.params.id);
         if (answer) {

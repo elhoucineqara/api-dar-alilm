@@ -43,7 +43,11 @@ app.use(cors(corsOptions));
 
 // Skip body parsing for upload routes - let multer handle it
 app.use((req, res, next) => {
-  if (req.path.includes('/upload')) {
+  if (
+    req.path.includes('/upload') ||
+    req.path.includes('/payments/stripe/webhook') ||
+    req.path.includes('/payments/paypal/webhook')
+  ) {
     // Skip body parsing for upload routes
     return next();
   }
@@ -52,7 +56,11 @@ app.use((req, res, next) => {
 });
 
 app.use((req, res, next) => {
-  if (req.path.includes('/upload')) {
+  if (
+    req.path.includes('/upload') ||
+    req.path.includes('/payments/stripe/webhook') ||
+    req.path.includes('/payments/paypal/webhook')
+  ) {
     return next();
   }
   express.urlencoded({ limit: '50mb', extended: true })(req, res, next);
@@ -61,7 +69,9 @@ app.use((req, res, next) => {
 // Routes
 const authRoutes = require('./routes/auth');
 const courseRoutes = require('./routes/courses');
+const publicCategoryRoutes = require('./routes/public-categories');
 const publicCoursesRoutes = require('./routes/public-courses');
+const instructorCategoryRoutes = require('./routes/instructor-categories');
 const instructorRoutes = require('./routes/instructor');
 const studentRoutes = require('./routes/student');
 const forumRoutes = require('./routes/forum');
@@ -74,8 +84,11 @@ const filesRoutes = require('./routes/files');
 const contactRoutes = require('./routes/contact');
 const aboutRoutes = require('./routes/about');
 const certificatesRoutes = require('./routes/certificates');
+const paymentRoutes = require('./routes/payments');
+const adminRoutes = require('./routes/admin');
 
 app.use('/api/auth', authRoutes);
+app.use('/api/courses/categories', publicCategoryRoutes);
 app.use('/api/courses', publicCoursesRoutes); // Public courses route (no auth required)
 app.use('/api/quizzes', publicQuizRoutes); // Public quiz route (requires auth, checks enrollment/ownership)
 app.use('/api/instructor/courses', courseRoutes);
@@ -83,6 +96,7 @@ app.use('/api/instructor/modules', moduleRoutes);
 app.use('/api/instructor/sections', sectionRoutes);
 app.use('/api/instructor/quizzes', quizRoutes);
 app.use('/api/instructor/upload', uploadRoutes);
+app.use('/api/instructor/categories', instructorCategoryRoutes);
 app.use('/api/instructor', instructorRoutes);
 app.use('/api/student', studentRoutes);
 app.use('/api/forum', forumRoutes);
@@ -90,6 +104,8 @@ app.use('/api/files', filesRoutes); // Public files route (no auth required)
 app.use('/api/contact', contactRoutes); // Public contact route
 app.use('/api/about', aboutRoutes); // Public about route
 app.use('/api/certificates', certificatesRoutes); // Public certificates route (no auth required)
+app.use('/api/payments', paymentRoutes);
+app.use('/api/admin', adminRoutes);
 
 // Basic route
 app.get('/', (req, res) => {
